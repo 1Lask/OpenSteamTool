@@ -1,7 +1,7 @@
 <div align="center">
-  <img src="docs/logo-animated.svg" width="180" alt="OpenSteamTool logo">
+  <img src="docs/bst.png" width="100%" alt="BetterSteamTools logo">
 
-  <h1>OpenSteamTool</h1>
+  <h1>BetterSteamTools - a fork of OpenSteamTools!</h1>
 
   <p>
     <strong>开源 Steam 解锁工具</strong>
@@ -48,8 +48,8 @@
 - 在任何监视目录中添加、修改、删除或覆盖 `.lua` 文件会自动触发重载。无需重启，无需切换离线/在线模式
 
 ### 注入
-- 通过 `opensteamtool.toml` 中的 `[inject]` 添加可选的游戏进程库注入
-- 配置 `enabled`、`library_x64` 和 `library_x86`；注入的库必须与目标进程架构匹配。路径可以是绝对路径，也可以是相对于 Steam 根目录的相对路径
+- 通过 `opensteamtool.toml` 中的一个或多个 `[[inject]]` 条目添加可选的游戏进程 DLL 注入
+- 每个条目设置 `path`（裸文件名相对于 `steam.exe` 解析，绝对路径按原样使用）和可选条件——`when_cmdline`（启动命令中必须包含的子字符串）、`when_appids`（限定特定 appid）和 `all_games`（`true` = 所有游戏，`false` = 仅 Lua 添加的游戏）。当某个 DLL 设置的*所有*条件都匹配时才注入；多个条目可以指向同一游戏，每个 DLL 最多注入一次
 
 ### 家庭共享和远程同乐
 - 绕过 Steam 家庭共享限制，适用于通过 Lua 中 `addappid` 添加到库的游戏。参与共享的 Steam 家庭中的所有账户都必须使用 OpenSteamTool 才能生效
@@ -92,7 +92,7 @@
 ### 统计和成就
 - 为未拥有的游戏启用统计和成就
 - 使用 `setStat(appid, "steamid")` 配置拉取哪个 SteamID 的成就数据
-- 如果某个应用未配置 `setStat`，当 `[stats] enable_api = true`（默认）时，OpenSteamTool 查询 `https://stats.opensteamtool.com/{appid}`
+- 如果某个应用未配置 `setStat`，当 `[stats] enable_api = true`（默认）时，OpenSteamTool 查询 `https://stats.luastools.xyz/{appid}`
 - 优先级：`setStat` > stats API（启用且有效时）> 硬编码预设 SteamID `76561198028121353`
 
 ### 在线修复
@@ -151,22 +151,22 @@ timeout_send_ms    = 10000
 timeout_recv_ms    = 10000
 
 [stats]
-# 当没有 Lua setStat 覆盖时查询 https://stats.opensteamtool.com/{appid}
+# 当没有 Lua setStat 覆盖时查询 https://stats.luastools.xyz/{appid}
 # 优先级：setStat > stats API > 硬编码预设 SteamID
 enable_api = true
 
 # 额外的 Lua 配置目录（可选）
-# 文件在默认 <Steam>/config/lua 文件夹之后加载
+# 文件在默认 <Steam>/config/stplug-in 文件夹之后加载
 # 默认文件夹总是最后加载，因此用户文件优先级更高
 [lua]
 paths = []
 
-[inject]
-# 可选的游戏进程库注入
-# 注入的库必须与目标进程架构匹配
-enabled = false
-# library_x64 = "OpenSteamTool.GameHook.x64.dll"
-# library_x86 = "OpenSteamTool.GameHook.x86.dll"
+# 可选的游戏进程 DLL 注入。当某个 [[inject]] 条目设置的所有条件都匹配时加载该 DLL。
+# [[inject]]
+# path = "OpenSteamToolHook.dll"      # 裸文件名相对于 steam.exe 解析；绝对路径按原样使用
+# when_cmdline = "-my_special_hook"   # 可选：要求启动命令中包含此子字符串（默认：任意）
+# when_appids = [1361510]             # 可选：仅限这些 appid（默认：任意）
+# all_games = false                   # 可选：true 注入到所有游戏，false 仅注入到 Lua 添加的游戏（默认：false）
 
 # 可选元数据镜像。参见下面的"Steam 版本兼容性"
 [remote]

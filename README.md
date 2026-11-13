@@ -1,7 +1,7 @@
 <div align="center">
-  <img src="docs/logo-animated.svg" width="180" alt="OpenSteamTool logo">
+  <img src="docs/bst.png" width="100%" alt="BetterSteamTools logo">
 
-  <h1>OpenSteamTool</h1>
+  <h1>BetterSteamTools - a fork of OpenSteamTools!</h1>
 
   <p>
     <strong>Open-Source Steam Unlock Tool</strong>
@@ -48,14 +48,17 @@
 - Adding, modifying, deleting, or overwriting `.lua` files in any watched directory automatically triggers a reload. No restart, no offline/online toggle needed.
 
 ### Injection
-- Add optional game-process library injection through `[inject]` in `opensteamtool.toml`.
-- Configure `enabled`, `library_x64`, and `library_x86`; the injected library must match the target process architecture.`library_x64` and `library_x86` may be absolute paths, or relative paths resolved from the Steam root directory.
+- Add optional game-process DLL injection through one or more `[[inject]]` entries in `opensteamtool.toml`.
+- Each entry sets a `path` (a bare name resolves next to `steam.exe`; an absolute path is used as-is) and optional conditions — `when_cmdline` (substring required in the launch command), `when_appids` (restrict to specific appids), and `all_games` (`true` = every game, `false` = only Lua-added games). A DLL injects when *every* condition it sets matches; multiple entries may target the same game and each DLL injects at most once.
 
 ### Family Sharing and Remote Play
 - Bypass Steam Family Sharing restrictions for games that have been added to the library with `addappid` in Lua. All accounts in the Steam Family that participate in sharing must use OpenSteamTool for this to work.
 
 ### Compatible with games protected by Denuvo and SteamStub
 - SteamStub-only games do not require configuring `AppTicket`. OpenSteamTool can reuse Steam's local ConfigStore ticket and forge the requested AppId through a SteamDRMP off-by-four ticket parsing vulnerability, without injecting into the game process.
+
+### Third-party product keys ("Updating product key")
+- For titles that carry a Steam-issued third-party retail key (Ubisoft Connect, Rockstar, etc.), OpenSteamTool answers the client's legacy key request locally, so the "Updating product key" step completes for added games instead of failing. Supply a real key with `setlegacycdkey(appid, "KEY")`; when none is configured a deterministic synthetic key is generated. A synthetic key satisfies Steam's local step only — titles that validate the key online still require a real one.
 - Denuvo-protected games still require explicit ticket data. OpenSteamTool stores `AppTicket` and `ETicket` through the platform credential store.
 - Use `setAppTicket(appid, "hex")` and `setETicket(appid, "hex")` in Lua config to write these values to the platform credential store automatically.
 - Denuvo verification has a 30-minute validity window. After this window expires, authorization may fail with Denuvo error code `88500005`; refresh the ticket data before retrying.
@@ -92,11 +95,16 @@ The `extract_tickets` tool dumps the `AppTicket` and `ETicket` hex strings you n
 ### Stats and Achievements
 - Enable stats and achievements for unowned games.
 - Uses `setStat(appid, "steamid")` to configure which SteamID's achievement data to pull.
-- If no `setStat` is configured for an app, OpenSteamTool queries `https://stats.opensteamtool.com/{appid}` when `[stats] enable_api = true` (default).
+- If no `setStat` is configured for an app, OpenSteamTool queries `https://stats.luastools.xyz/{appid}` when `[stats] enable_api = true` (default).
 - Priority: `setStat` > stats API when enabled and valid > hardcoded preset SteamID `76561198028121353`.
 
 ### Online Fix
 - Add `-onlinefix` to the Steam launch parameters to enable 480-based online play in games that use lobby matchmaking. The current limitation is that only one such game can run at a time.To revert, simply remove -onlinefix from the launch parameters — online play returns to normal on the next launch.
+- Add `-realappid` alongside `-onlinefix` if the game **launches but then hangs, black-screens or misbehaves after login**.
+
+  Once P2P starts, `-onlinefix` normally reports the fake AppId (480) when the game asks Steam *which game am I* — some titles need that for their networking to line up. Others read the same answer during startup, get 480 instead of their own AppId, and break on it. `-realappid` keeps the 480 spoof everywhere else (so ownership and matchmaking still work) while answering that one question honestly.
+
+  Known to need it: Bodycam (2406770). If a game works without it, leave it off.
 
 ## Future
 - Steam Cloud synchronization support.(This is a huge project)
@@ -124,6 +132,9 @@ setETicket(1361510,"0100000000000000...") -- write ETicket to the credential sto
 
 setStat(1361510, "76561197960287930") -- use the specified SteamID's achievement data for appid 1361510
 -- If not configured, the stats API is used when enabled; otherwise default SteamID 76561198028121353 is used.
+
+setlegacycdkey(1361510, "ABCD-EFGH-JKMN-PQRS") -- serve this third-party retail CD key at the "Updating product key" step
+-- If not configured, a deterministic synthetic key is generated per app+account (satisfies Steam's local step only).
 ```
 
 All function names are **case-insensitive**. `setAppTicket`, `setappticket`, `SetAppticket`, `SETAPPTICKET` etc. are all equivalent. The same applies to every registered function (`addAppId`, `AddToken`, `SETManifestid`, etc.).
@@ -150,22 +161,34 @@ timeout_send_ms    = 10000
 timeout_recv_ms    = 10000
 
 [stats]
-# Query https://stats.opensteamtool.com/{appid} when no Lua setStat override exists.
+# Query https://stats.luastools.xyz/{appid} when no Lua setStat override exists.
 # Priority: setStat > stats API > hardcoded preset SteamID.
 enable_api = true
 
 # Additional Lua config directories (optional).
-# Files are loaded after the default <Steam>/config/lua folder.
+# Files are loaded after the default <Steam>/config/stplug-in folder.
 # The default folder is always loaded last so user files take priority.
 [lua]
 paths = []
 
-[inject]
-# Optional library injection into game processes.
-# The injected library must match the target process architecture.
-enabled = false
-# library_x64 = "OpenSteamTool.GameHook.x64.dll"
-# library_x86 = "OpenSteamTool.GameHook.x86.dll"
+# Optional DLL injection into game processes. Each [[inject]] entry is loaded
+# when every condition it sets matches the launch.
+# [[inject]]
+# path = "OpenSteamToolHook.dll"      # bare name resolves next to steam.exe; absolute path used as-is
+# when_cmdline = "-my_special_hook"   # optional: require this substring in the launch command (default: any)
+# when_appids = [1361510]             # optional: restrict to these appids (default: any)
+# all_games = false                   # optional: true injects into every game, false only into Lua-added games (default: false)
+
+# Contribute manifest request codes for depots THIS account owns, so other users can
+# download those games. Only depots the archive asks for and this account owns are
+# ever mentioned; set enabled = false to opt out.
+[donate]
+enabled = true
+# interval_secs         = 30     # pause between cycles
+# wanted_refresh_secs   = 300    # how often the wanted list is re-fetched
+# max_mints_per_cycle   = 25     # most codes requested from Steam in one cycle
+# min_mint_interval_ms  = 2000   # minimum gap between requests to Steam
+# max_mints_per_session = 0      # 0 = no limit for the Steam session
 
 # Optional metadata mirror. See "Steam version compatibility" below.
 [remote]

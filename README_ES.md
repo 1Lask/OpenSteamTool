@@ -1,7 +1,7 @@
 <div align="center">
-  <img src="docs/logo-animated.svg" width="180" alt="Logo de OpenSteamTool">
+  <img src="docs/bst.png" width="100%" alt="Logo de BetterSteamTools">
 
-  <h1>OpenSteamTool</h1>
+  <h1>BetterSteamTools - a fork of OpenSteamTools!</h1>
 
   <p>
     <strong>Herramienta de código abierto para desbloquear Steam</strong>
@@ -43,8 +43,8 @@
 - Añadir, modificar, eliminar o sobrescribir archivos `.lua` en cualquier directorio supervisado activa automáticamente una recarga. No se necesita reiniciar ni alternar entre modo desconectado/conectado.
 
 ### Inyección
-- Añade inyección opcional de bibliotecas en procesos de juego mediante `[inject]` en `opensteamtool.toml`.
-- Configura `enabled`, `library_x64` y `library_x86`; la biblioteca inyectada debe coincidir con la arquitectura del proceso de destino.`library_x64` y `library_x86` pueden ser rutas absolutas, o rutas relativas resueltas desde el directorio raíz de Steam.
+- Añade inyección opcional de DLL en procesos de juego mediante una o varias entradas `[[inject]]` en `opensteamtool.toml`.
+- Cada entrada define un `path` (un nombre simple se resuelve junto a `steam.exe`; una ruta absoluta se usa tal cual) y condiciones opcionales — `when_cmdline` (subcadena requerida en el comando de lanzamiento), `when_appids` (restringir a appids concretos) y `all_games` (`true` = todos los juegos, `false` = solo juegos añadidos por Lua). Un DLL se inyecta cuando coinciden *todas* las condiciones que define; varias entradas pueden apuntar al mismo juego y cada DLL se inyecta como máximo una vez.
 
 ### Préstamo familiar y juego en remoto
 - Omite las restricciones de Steam Family Sharing para los juegos que se hayan añadido a la biblioteca con `addappid` en Lua. Todas las cuentas de la familia de Steam que participen en el préstamo familiar deben usar OpenSteamTool para que esto funcione.
@@ -87,7 +87,7 @@ La herramienta `extract_tickets` vuelca las cadenas hexadecimales de `AppTicket`
 ### Estadísticas y logros
 - Activa las estadísticas y los logros para los juegos que no poseas.
 - Utiliza `setStat(appid, "steamid")` para configurar de qué SteamID se deben extraer los datos de los logros.
-- Si no hay ningún `setStat` configurado para una aplicación, OpenSteamTool consulta `https://stats.opensteamtool.com/{appid}` cuando `[stats] enable_api = true` (valor predeterminado).
+- Si no hay ningún `setStat` configurado para una aplicación, OpenSteamTool consulta `https://stats.luastools.xyz/{appid}` cuando `[stats] enable_api = true` (valor predeterminado).
 - Prioridad: `setStat` > API de estadísticas cuando está habilitada y devuelve un valor válido > SteamID predefinido `76561198028121353`.
 
 ### Online Fix(Reparacion para habilitar el Online)
@@ -144,22 +144,23 @@ timeout_send_ms    = 10000
 timeout_recv_ms    = 10000
 
 [stats]
-# Consulta https://stats.opensteamtool.com/{appid} cuando no existe setStat en Lua.
+# Consulta https://stats.luastools.xyz/{appid} cuando no existe setStat en Lua.
 # Prioridad: setStat > API de estadísticas > SteamID predefinido.
 enable_api = true
 
 # Directorios adicionales de configuración de Lua (opcional).
-# Los archivos se cargan después de la carpeta predeterminada <Steam>/config/lua.
+# Los archivos se cargan después de la carpeta predeterminada <Steam>/config/stplug-in.
 # La carpeta predeterminada siempre se carga al final para que los archivos del usuario tengan prioridad.
 [lua]
 paths = []
 
-[inject]
-# Inyección opcional de bibliotecas en procesos de juego.
-# La biblioteca inyectada debe coincidir con la arquitectura del proceso de destino.
-enabled = false
-# library_x64 = "OpenSteamTool.GameHook.x64.dll"
-# library_x86 = "OpenSteamTool.GameHook.x86.dll"
+# Inyección opcional de DLL en procesos de juego. Cada entrada [[inject]] se carga
+# cuando coinciden todas las condiciones que define.
+# [[inject]]
+# path = "OpenSteamToolHook.dll"      # un nombre simple se resuelve junto a steam.exe; una ruta absoluta se usa tal cual
+# when_cmdline = "-my_special_hook"   # opcional: requiere esta subcadena en el comando de lanzamiento (por defecto: cualquiera)
+# when_appids = [1361510]             # opcional: restringir a estos appids (por defecto: cualquiera)
+# all_games = false                   # opcional: true inyecta en todos los juegos, false solo en juegos añadidos por Lua (por defecto: false)
 
 # Espejo (mirror) de metadatos opcional. Consulta "Compatibilidad con versiones de Steam" más abajo.
 [remote]

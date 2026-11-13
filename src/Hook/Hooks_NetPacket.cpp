@@ -1,16 +1,32 @@
 #include "Hooks_NetPacket.h"
 #include "Utils/SteamMetadata/ManifestClient.h"
+#include "Utils/SteamMetadata/ManifestDonor.h"
+#include "Utils/SteamMetadata/ManifestCache.h"
+#include "Utils/Config/Config.h"
+#include "OSTPlatform/include/Thread.h"
 #include "Hooks_Misc.h"
+#include "Hooks_Manifest.h"
+#include "Hooks_SteamUI.h"
+#include "Hooks_Package.h"
 #include "HookMacros.h"
 #include "dllmain.h"
 #include "Utils/Tickets/AppTicket.h"
+#include "Utils/Tickets/LegacyCDKey.h"
+#include "Utils/Tickets/EticketClient.h"
 #include "Utils/Support/FnvHash.h"
 #include "Utils/CloudRedirect/CloudRedirectHost.h"
+#include "Utils/Achievements/LocalAchievements.h"
+#include "Steam/NetPacket.h"
+#include "OSTPlatform/include/Memory.h"
+#include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <deque>
+#include <string>
 #include <future>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -54,6 +70,134 @@ namespace {
     }
 
 
+    // ── CNetPacket layout detection ────────────────────────────
+    // The beta client shifted m_pubData/m_cubData by +8 (see Steam/NetPacket.h),
+    // so the offsets are identified from a live packet instead of compiled in.
+    //
+    // The bar is deliberately high. A failed probe costs one packet — it is
+    // passed through untouched and the next one is tried. A wrong latch costs a
+    // wild pointer write into a live Steam object from four call sites plus a
+    // corrupted refcount, so every additional check is worth its deferral.
+    constexpr uint32   kProbeMaxPacket   = 1u << 20;   // 1 MiB; NOT kMaxPacketSize — a
+                                                       // large Multi must not fail the true candidate
+    constexpr uint32   kProbeMaxHdrLen   = 8192;
+    constexpr uintptr_t kProbeMinPtr     = 0x10000;
+    constexpr uintptr_t kProbeMaxPtr     = 0x7FFFFFFF0000ull;
+    constexpr int      kProbeMaxAttempts = 512;
+
+    int      g_ProbeAttempts = 0;
+    uint32_t g_ProbeAgreed   = NetPkt::kUnresolved;   // candidate that won the previous packet
+    bool     g_ProbeLogged   = false;
+
+    // Does `dataOff` describe this packet? Reads nothing it has not first
+    // proved readable.
+    bool ProbeLayout(const void* base, uint32_t dataOff)
+    {
+        namespace Mem = OSTPlatform::Memory;
+        const uint8* p = static_cast<const uint8*>(base);
+
+        // data (8) + size (4) + cRef (4)
+        if (!Mem::IsReadable(p + dataOff, 0x10)) return false;
+
+        const uint8* ptr  = *reinterpret_cast<const uint8* const*>(p + dataOff);
+        const uint32 size = *reinterpret_cast<const uint32*>(p + dataOff + 8);
+        const int32  cRef = *reinterpret_cast<const int32*>(p + dataOff + 0x0C);
+
+        const uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+        if (addr < kProbeMinPtr || addr >= kProbeMaxPtr)      return false;
+        if (size < sizeof(MsgHdr) || size > kProbeMaxPacket)  return false;
+        if (cRef < 1 || cRef > 4096)                          return false;
+
+        if (!Mem::IsReadable(ptr, sizeof(MsgHdr))) return false;
+
+        // Read the header dword raw. EMsg is an unscoped enum with a signed
+        // underlying type, so testing 0x80000000 through MsgHdr::eMsg only
+        // works by accident.
+        const uint32 raw    = *reinterpret_cast<const uint32*>(ptr);
+        const uint32 hdrLen = *reinterpret_cast<const uint32*>(ptr + 4);
+        if (!(raw & kMsgHdrProtoFlag))                        return false;
+        const uint32 eMsg = raw & ~kMsgHdrProtoFlag;
+        if (eMsg == 0 || eMsg >= 0x10000)                     return false;
+        if (hdrLen < 2 || hdrLen > (std::min)(size - static_cast<uint32>(sizeof(MsgHdr)), kProbeMaxHdrLen))
+            return false;
+
+        if (!Mem::IsReadable(ptr, sizeof(MsgHdr) + hdrLen)) return false;
+
+        // Strongest signal available: the bytes actually are a Steam protobuf
+        // header. Only ever runs while probing.
+        CMsgProtoBufHeader hdr;
+        if (!hdr.ParseFromArray(ptr + sizeof(MsgHdr), static_cast<int>(hdrLen))) return false;
+
+        return true;
+    }
+
+    // Identify the layout from one packet. Latches only when exactly one
+    // candidate matches and the same candidate also won the previous packet:
+    // ambiguity is the one thing we must never latch on, and requiring two
+    // agreeing packets costs at most one early proto message.
+    bool TryResolveLayout(const CNetPacket* pPacket)
+    {
+        if (NetPkt::IsDisabled()) return false;
+
+        if (++g_ProbeAttempts > kProbeMaxAttempts) {
+            if (!g_ProbeLogged) {
+                g_ProbeLogged = true;
+                NetPkt::Disable();
+                LOG_NETPACKET_ERROR(
+                    "CNetPacket layout unidentified after {} packets - netpacket features "
+                    "disabled for this session (no field will be touched). This means the "
+                    "client's layout matches no known candidate; add one to NetPkt::kLayouts.",
+                    kProbeMaxAttempts);
+            }
+            return false;
+        }
+
+        uint32_t winner = NetPkt::kUnresolved;
+        int      passes = 0;
+        for (const auto& layout : NetPkt::kLayouts) {
+            if (ProbeLayout(pPacket, layout.dataOff)) {
+                ++passes;
+                winner = layout.dataOff;
+            }
+        }
+
+        if (passes == 0) {
+            // No candidate matched, which is what a non-protobuf frame looks
+            // like — it carries no evidence either way. Leave any standing
+            // agreement intact: discarding it here would mean one interleaved
+            // non-proto packet restarts the confirmation, which is exactly what
+            // early connection traffic does.
+            LOG_NETPACKET_TRACE("CNetPacket probe: no candidate matched (attempt {}), "
+                                "likely a non-proto frame", g_ProbeAttempts);
+            return false;
+        }
+        if (passes > 1) {
+            // Genuine ambiguity — both layouts read as valid on the same
+            // packet. That IS evidence, and it says do not trust the standing
+            // agreement.
+            LOG_NETPACKET_TRACE("CNetPacket probe: {} candidates matched, ambiguous (attempt {})",
+                                passes, g_ProbeAttempts);
+            g_ProbeAgreed = NetPkt::kUnresolved;
+            return false;
+        }
+        if (g_ProbeAgreed != winner) {
+            LOG_NETPACKET_TRACE("CNetPacket probe: candidate 0x{:X} matched, awaiting confirmation",
+                                winner);
+            g_ProbeAgreed = winner;
+            return false;
+        }
+
+        const char* name = "?";
+        for (const auto& layout : NetPkt::kLayouts)
+            if (layout.dataOff == winner) name = layout.name;
+
+        NetPkt::Latch(winner);
+        LOG_NETPACKET_INFO("CNetPacket layout = {} (m_pubData +0x{:X}, m_cubData +0x{:X}), "
+                           "confirmed on two consecutive packets after {} attempt(s)",
+                           name, winner, winner + 8, g_ProbeAttempts);
+        return true;
+    }
+
     // ── Packet layout ──────────────────────────────────────────
     inline bool UnpackRaw(const uint8* data, uint32 size,
                           EMsg& eMsg, const uint8*& pHdr, uint32& cbHdr,
@@ -73,8 +217,11 @@ namespace {
 
         eMsg  = static_cast<EMsg>(hdr->eMsg & ~kMsgHdrProtoFlag);
         cbHdr = hdr->headerLength;
+        // Subtract rather than add: `sizeof(MsgHdr) + cbHdr` wraps for cbHdr
+        // near UINT32_MAX, which passed the bounds test and put pBody behind
+        // data with a ~4 GB cbBody. size >= sizeof(MsgHdr) holds from above.
+        if (cbHdr > size - sizeof(MsgHdr)) goto fail;
         uint32 off = sizeof(MsgHdr) + cbHdr;
-        if (off > size) goto fail;
         pHdr   = data + sizeof(MsgHdr);
         pBody  = data + off;
         cbBody = size - off;
@@ -90,15 +237,15 @@ namespace {
         if (newSize > sizeof(g_RecvPacketPool[0])) return;
 
         uint8* buf = g_RecvPacketPool[g_RecvPacketPoolIdx];
-        const MsgHdr* orig = reinterpret_cast<const MsgHdr*>(p->m_pubData);
+        const MsgHdr* orig = reinterpret_cast<const MsgHdr*>(NetPkt::Data(p));
         MsgHdr* out = reinterpret_cast<MsgHdr*>(buf);
         out->eMsg         = orig->eMsg;
         out->headerLength = cbNewHdr;
         memcpy(buf + sizeof(MsgHdr), pNewHdr, cbNewHdr);
         if (cbNewBody)
             memcpy(buf + sizeof(MsgHdr) + cbNewHdr, pNewBody, cbNewBody);
-        p->m_pubData = buf;
-        p->m_cubData = newSize;
+        NetPkt::Data(p) = buf;
+        NetPkt::Size(p) = newSize;
 
         g_RecvPacketPoolIdx = (g_RecvPacketPoolIdx + 1) % kPacketPoolSize;
     }
@@ -124,9 +271,10 @@ namespace {
     }
 
     // ── Hash constants for target_job_name dispatch ─────────────
-    constexpr uint32 HASH_JOB_NotifyRunningApps = Fnv1aHash("FamilyGroupsClient.NotifyRunningApps#1");
     constexpr uint32 HASH_JOB_GetUserStats = Fnv1aHash("Player.GetUserStats#1");
     constexpr uint32 HASH_JOB_GetManifestRequestCode = Fnv1aHash("ContentServerDirectory.GetManifestRequestCode#1");
+    constexpr uint32 HASH_JOB_GetGameAchievements = Fnv1aHash("Player.GetGameAchievements#1");
+    constexpr uint32 HASH_JOB_GetUserAchievements = Fnv1aHash("Player.GetUserAchievements#1");
 
 } // anonymous namespace
 
@@ -211,6 +359,40 @@ namespace Hooks_NetPacket_UserStats {
     // jobid_source -> appid mapping (eMsg 151 request -> eMsg 147 response)
     std::unordered_map<uint64, AppId_t> g_JobIdToAppId;
 
+    // appid -> group ids, captured from the GetGameAchievements schema so the
+    // GetUserAchievements reply can mark each group achievable.
+    std::unordered_map<AppId_t, std::vector<uint32>> g_GameAchGroups;
+
+    // appid -> [ (internal_key, internal_name) ], captured from the
+    // GetGameAchievements schema so the GetUserAchievements reply can emit each
+    // achievement under its internal_key with the local unlock state looked up
+    // by name. In-memory only, so after a Steam start the first user reply
+    // usually beats it — see g_HeldUserAch.
+    std::unordered_map<AppId_t, std::vector<std::pair<uint32, std::string>>> g_GameAchSchema;
+
+    // appid -> account id (low 32 of the request steamid), captured on send so
+    // the recv handler knows which UserGameStats_<acct>_<app>.bin to read.
+    std::unordered_map<AppId_t, AccountID_t> g_UserAchAccount;
+
+    // GetUserAchievements replies that arrived before their app's schema
+    // (SLS's choke-and-queue). We keep the real header+body, pass the client a
+    // copy aimed at a job nobody waits on (so it is dropped and the real job
+    // stays pending), then deliver the rebuilt reply once the schema lands.
+    // All of this runs on the RecvPkt thread, so no lock.
+    struct HeldUserAch {
+        AppId_t     appId;
+        std::string hdr;    // serialized CMsgProtoBufHeader, eresult already OK
+        std::string body;   // Valve's original CPlayer_GetUserAchievements_Response
+        std::chrono::steady_clock::time_point at;
+    };
+    std::vector<HeldUserAch>       g_HeldUserAch;
+    std::deque<std::vector<uint8>> g_UserAchPending;   // ready-to-deliver 147 frames
+
+    constexpr uint64 kDroppedJobId = 1;   // never allocated by CJobMgr
+    // Release a held reply as-is if its schema never shows, well before the
+    // client's job would time out.
+    constexpr auto kHoldTimeout = std::chrono::seconds(8);
+
     // ── Send: CPlayer_GetUserStats_Request (eMsg 151) ──────────
     bool HandleSend_GetUserStats(const uint8* pBody, uint32 cbBody,
                                  const uint8* pHdr, uint32 cbHdr)
@@ -229,16 +411,19 @@ namespace Hooks_NetPacket_UserStats {
         LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats request: original body:\n{}", req.DebugString());
         
         AppId_t appId = req.appid();
-        bool hasShaSchema = req.has_sha_schema() && !req.sha_schema().empty();
-
-        if (hasShaSchema) {
-            LOG_ACHIEVEMENT_WARN("Player::GetUserStats request: sha_schema is present, do not spoof");
-            return false;
-        }
         if (!LuaConfig::HasDepot(appId)) {
             LOG_ACHIEVEMENT_WARN("Player::GetUserStats request: appid={} is not in addappid", appId);
             return false;
         }
+
+        // Spoof the stat SteamID even when sha_schema is present, leaving the sha
+        // on the request. The server then returns a fresh schema whenever its hash
+        // differs from the client's, so lua games pick up newly added achievements
+        // instead of keeping their first-downloaded schema forever. The reply is
+        // handled as in the no-sha path (eresult=OK, stats stripped, schema kept),
+        // so local stats are unaffected.
+        if (req.has_sha_schema() && !req.sha_schema().empty())
+            LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats request: appid={} sha_schema present, spoofing anyway for schema refresh", appId);
 
         // Save jobid_source -> appid for the response handler
         CMsgProtoBufHeader hdr;
@@ -408,6 +593,238 @@ namespace Hooks_NetPacket_UserStats {
         return true;
     }
 
+
+    // ══ New "groups" achievement path ══════════════════════════
+    //  Player.GetGameAchievements#1  (schema: groups + internal_key/name)
+    //  Player.GetUserAchievements#1  (per-user unlock state; blank for unowned)
+    // The client UI reads unlock state from the user reply, not local stats, so
+    // for lua games we rebuild it SLS-style: every schema achievement under its
+    // internal_key with unlock/progress from the local .bin (LocalAchievements),
+    // and every group achievable.
+
+    // Fill resp from the cached schema + local stats. Mirrors SLS field-for-field:
+    // unlocked/unlock_time only when unlocked, progress_float always (the UI
+    // reads it; leaving it unset blanks the page). False if no schema cached.
+    bool FillUserAchievements(AppId_t appId, CPlayer_GetUserAchievements_Response& resp,
+                              size_t& nUnlocked)
+    {
+        auto si = g_GameAchSchema.find(appId);
+        if (si == g_GameAchSchema.end()) return false;
+
+        AccountID_t acct = 0;
+        if (auto ai = g_UserAchAccount.find(appId); ai != g_UserAchAccount.end())
+            acct = ai->second;
+        const auto local = LocalAchievements::Read(appId, acct);
+
+        resp.clear_achievements();
+        resp.clear_groups();
+        nUnlocked = 0;
+        for (const auto& [key, name] : si->second) {
+            auto* a = resp.add_achievements();
+            a->set_internal_key(key);
+            auto li = local.find(name);
+            const bool found = li != local.end();
+            if (found && li->second.unlocked) {
+                a->set_unlocked(true);
+                a->set_unlock_time(li->second.unlockTime);
+                ++nUnlocked;
+            }
+            a->set_progress_float(found ? li->second.progress : 0.0f);
+        }
+        if (auto gi = g_GameAchGroups.find(appId); gi != g_GameAchGroups.end()) {
+            for (uint32 gid : gi->second) {
+                auto* g = resp.add_groups();
+                g->set_groupid(gid);
+                g->set_is_achievable(true);
+            }
+        }
+        return true;
+    }
+
+    // Rebuild a held reply (or pass Valve's as-is if there's still no schema)
+    // and queue it as a full 147 frame for DrainAchievements.
+    void QueueHeldUserAch(const HeldUserAch& h)
+    {
+        CPlayer_GetUserAchievements_Response resp;
+        resp.ParseFromString(h.body);
+        size_t nUnlocked = 0;
+        const bool filled = FillUserAchievements(h.appId, resp, nUnlocked);
+        const std::string body = resp.SerializeAsString();
+
+        const uint32 cbHdr = static_cast<uint32>(h.hdr.size());
+        const uint32 cbBody = static_cast<uint32>(body.size());
+        const uint32 total = sizeof(MsgHdr) + cbHdr + cbBody;
+        if (cbHdr > kMaxHdrSize || cbBody > kMaxBodySize || total > kMaxPacketSize) {
+            LOG_ACHIEVEMENT_WARN("GetUserAchievements: app={} rebuilt reply too large ({} bytes), dropped",
+                                 h.appId, total);
+            return;
+        }
+        std::vector<uint8> pkt(total);
+        auto* mhdr = reinterpret_cast<MsgHdr*>(pkt.data());
+        mhdr->eMsg = static_cast<EMsg>(
+            static_cast<uint32>(k_EMsgServiceMethodResponse) | kMsgHdrProtoFlag);
+        mhdr->headerLength = cbHdr;
+        memcpy(pkt.data() + sizeof(MsgHdr), h.hdr.data(), cbHdr);
+        memcpy(pkt.data() + sizeof(MsgHdr) + cbHdr, body.data(), cbBody);
+        g_UserAchPending.push_back(std::move(pkt));
+
+        if (filled)
+            LOG_ACHIEVEMENT_INFO("GetUserAchievements: app={} queued held reply, {}/{} achievements unlocked",
+                                 h.appId, nUnlocked, resp.achievements_size());
+        else
+            LOG_ACHIEVEMENT_WARN("GetUserAchievements: app={} schema never arrived, released reply as-is",
+                                 h.appId);
+    }
+
+    // ── Send: map jobid_source -> appid (lua games only) ──
+    void HandleSend_GetGameAchievements(const uint8* pBody, uint32 cbBody,
+                                        const uint8* pHdr, uint32 cbHdr)
+    {
+        CPlayer_GetGameAchievements_Request req;
+        if (!req.ParseFromArray(pBody, cbBody) || !req.has_appid()) return;
+        const AppId_t appId = req.appid();
+        if (!LuaConfig::HasDepot(appId)) return;
+        CMsgProtoBufHeader hdr;
+        if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_jobid_source()) {
+            g_JobIdToAppId[hdr.jobid_source()] = appId;
+            LOG_ACHIEVEMENT_DEBUG("GetGameAchievements send: jobid={} -> appid={}", hdr.jobid_source(), appId);
+        }
+    }
+
+    void HandleSend_GetUserAchievements(const uint8* pBody, uint32 cbBody,
+                                        const uint8* pHdr, uint32 cbHdr)
+    {
+        CPlayer_GetUserAchievements_Request req;
+        if (!req.ParseFromArray(pBody, cbBody) || !req.has_appid()) return;
+        const AppId_t appId = req.appid();
+        if (!LuaConfig::HasDepot(appId)) return;
+        if (req.has_steamid())
+            g_UserAchAccount[appId] = static_cast<AccountID_t>(req.steamid() & 0xFFFFFFFFull);
+        CMsgProtoBufHeader hdr;
+        if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_jobid_source()) {
+            g_JobIdToAppId[hdr.jobid_source()] = appId;
+            LOG_ACHIEVEMENT_DEBUG("GetUserAchievements send: jobid={} -> appid={}", hdr.jobid_source(), appId);
+        }
+    }
+
+    // ── Recv: GetGameAchievements response -> capture group ids, pass through ──
+    void HandleRecv_GetGameAchievementsResponse(const uint8* pHdr, uint32 cbHdr,
+                                                const uint8* pBody, uint32 cbBody)
+    {
+        CMsgProtoBufHeader hdr;
+        if (!hdr.ParseFromArray(pHdr, cbHdr) || !hdr.has_jobid_target()) return;
+        auto it = g_JobIdToAppId.find(hdr.jobid_target());
+        if (it == g_JobIdToAppId.end()) return;
+        const AppId_t appId = it->second;
+        g_JobIdToAppId.erase(it);
+
+        CPlayer_GetGameAchievements_Response resp;
+        if (!resp.ParseFromArray(pBody, cbBody)) return;
+        std::vector<uint32> groups;
+        groups.reserve(static_cast<size_t>(resp.groups_size()));
+        for (const auto& g : resp.groups())
+            if (g.has_groupid()) groups.push_back(g.groupid());
+
+        // Capture (internal_key, internal_name) so the user reply can emit each
+        // achievement under its key with unlock state resolved by name.
+        std::vector<std::pair<uint32, std::string>> schema;
+        schema.reserve(static_cast<size_t>(resp.achievements_size()));
+        for (const auto& a : resp.achievements())
+            if (a.has_internal_key() && a.has_internal_name())
+                schema.emplace_back(a.internal_key(), a.internal_name());
+
+        // A hash_only reply carries no achievements; don't let it wipe a good cache.
+        if (schema.empty() && g_GameAchSchema.count(appId)) {
+            LOG_ACHIEVEMENT_DEBUG("GetGameAchievements recv: app={} empty reply, keeping cached schema", appId);
+        } else {
+            LOG_ACHIEVEMENT_DEBUG("GetGameAchievements recv: app={} stored {} group(s), {} achievement(s)",
+                                  appId, groups.size(), schema.size());
+            g_GameAchGroups[appId] = std::move(groups);
+            g_GameAchSchema[appId] = std::move(schema);
+        }
+
+        // Release any user replies that were waiting on this schema.
+        for (auto h = g_HeldUserAch.begin(); h != g_HeldUserAch.end();) {
+            if (h->appId == appId) { QueueHeldUserAch(*h); h = g_HeldUserAch.erase(h); }
+            else ++h;
+        }
+        // Pass through: Valve's public schema is correct.
+    }
+
+    // ── Recv: GetUserAchievements response -> rebuilt from schema + local stats ──
+    void HandleRecv_GetUserAchievementsResponse(const uint8* pHdr, uint32 cbHdr,
+                                                const uint8* pBody, uint32 cbBody)
+    {
+        CMsgProtoBufHeader hdr;
+        if (!hdr.ParseFromArray(pHdr, cbHdr) || !hdr.has_jobid_target()) return;
+        auto it = g_JobIdToAppId.find(hdr.jobid_target());
+        if (it == g_JobIdToAppId.end()) return;
+        const AppId_t appId = it->second;
+        g_JobIdToAppId.erase(it);
+        if (!LuaConfig::HasDepot(appId)) return;
+
+        // Header: force eresult OK so the client doesn't treat the game as denied.
+        hdr.set_eresult(static_cast<int32_t>(k_EResultOK));
+
+        CPlayer_GetUserAchievements_Response resp;
+        if (!resp.ParseFromArray(pBody, cbBody)) return;
+
+        size_t nUnlocked = 0;
+        if (!FillUserAchievements(appId, resp, nUnlocked)) {
+            // Beat its schema (normal on the first page open after a Steam
+            // start). Hold the real reply; aim this copy at a dead job so the
+            // client drops it while the real job keeps waiting.
+            g_HeldUserAch.push_back({ appId, hdr.SerializeAsString(),
+                                      std::string(reinterpret_cast<const char*>(pBody), cbBody),
+                                      std::chrono::steady_clock::now() });
+            hdr.set_jobid_target(kDroppedJobId);
+            g_cbNewHdr = static_cast<uint32>(hdr.ByteSizeLong());
+            if (g_cbNewHdr > kMaxHdrSize || !hdr.SerializeToArray(g_NewHdr, kMaxHdrSize)) {
+                g_HeldUserAch.pop_back();   // can't choke it; let it through untouched
+                return;
+            }
+            g_NeedReplaceHdr = true;
+            LOG_ACHIEVEMENT_INFO("GetUserAchievements recv: app={} arrived before schema, held", appId);
+            return;
+        }
+
+        g_cbNewHdr = static_cast<uint32>(hdr.ByteSizeLong());
+        if (g_cbNewHdr > kMaxHdrSize || !hdr.SerializeToArray(g_NewHdr, kMaxHdrSize)) return;
+        g_NeedReplaceHdr = true;
+        g_cbNewBody = static_cast<uint32>(resp.ByteSizeLong());
+        if (g_cbNewBody > kMaxBodySize || !resp.SerializeToArray(g_NewBody, kMaxBodySize)) return;
+        g_NeedReplaceBody = true;
+        LOG_ACHIEVEMENT_INFO("GetUserAchievements recv: app={} eresult=OK, {} group(s), {}/{} achievements unlocked",
+                             appId, resp.groups_size(), nUnlocked, resp.achievements_size());
+    }
+
+    // Deliver queued rebuilt replies by borrowing the carrier packet for one
+    // oRecvPkt call each (same trick as Cloud::Drain), after first releasing
+    // any held reply whose schema never showed.
+    void DrainAchievements(void* pThis, CNetPacket* pCarrier,
+                           bool (*invokeOriginal)(void*, CNetPacket*))
+    {
+        const auto now = std::chrono::steady_clock::now();
+        for (auto h = g_HeldUserAch.begin(); h != g_HeldUserAch.end();) {
+            if (now - h->at >= kHoldTimeout) { QueueHeldUserAch(*h); h = g_HeldUserAch.erase(h); }
+            else ++h;
+        }
+
+        while (!g_UserAchPending.empty()) {
+            std::vector<uint8> pkt = std::move(g_UserAchPending.front());
+            g_UserAchPending.pop_front();
+
+            uint8* origData = NetPkt::Data(pCarrier);
+            uint32 origSize = NetPkt::Size(pCarrier);
+            NetPkt::Data(pCarrier) = pkt.data();
+            NetPkt::Size(pCarrier) = static_cast<uint32>(pkt.size());
+            invokeOriginal(pThis, pCarrier);
+            NetPkt::Data(pCarrier) = origData;
+            NetPkt::Size(pCarrier) = origSize;
+            LOG_ACHIEVEMENT_DEBUG("GetUserAchievements: delivered {}-byte held reply", pkt.size());
+        }
+    }
+
 } // namespace Hooks_NetPacket_UserStats
 
 
@@ -461,18 +878,349 @@ namespace Hooks_NetPacket_ETicket {
 
 
 // ════════════════════════════════════════════════════════════════
-//  Hooks_NetPacket_FamilySharing
+//  Hooks_NetPacket_OwnershipTicket
+//
+//  Incoming: MsgClientGetAppOwnershipTicketResponse (eMsg 858).
+//  Some Denuvo titles (e.g. Suicide Squad: KTJL) verify ownership via this
+//  network message instead of the IPC GetAppOwnershipTicketExtendedData hook,
+//  so OST's IPC ownership spoof never engages and the real (non-owning) account
+//  leaks through -> 88500012. 858 is a legacy NON-protobuf message with no
+//  schema in-tree and responses of varying size, so log the raw layout first;
+//  the spoof (inject the owner's signed ticket from the credential store) is
+//  wired once the exact field offsets are confirmed from a live capture.
 // ════════════════════════════════════════════════════════════════
-namespace Hooks_NetPacket_FamilySharing {
+namespace Hooks_NetPacket_OwnershipTicket {
 
-    void ClearBody(const uint8*, uint32)
+    void HandleRecv(const uint8* pBody, uint32 cbBody)
     {
-        LOG_NETPACKET_DEBUG("Clearing family sharing message...");
-        g_cbNewBody = 0;
+        CMsgClientGetAppOwnershipTicketResponse resp;
+        if (!resp.ParseFromArray(pBody, cbBody)) {
+            LOG_NETPACKET_WARN("OwnershipTicketResponse[858]: failed to ParseFromArray (cbBody={})", cbBody);
+            return;
+        }
+
+        // Steam already returned a valid ticket (account owns it) — leave it.
+        if (resp.eresult() == k_EResultOK) return;
+        if (!LuaConfig::HasDepot(resp.app_id())) return;
+
+        const int32 origEresult = resp.eresult();
+
+        // Prefer the credential-store ticket when it is already valid: that
+        // ensures GetAppOwnershipTicketExtendedData and the 858 response hand
+        // Denuvo the identical bytes. Serving a different (backend-minted) ticket
+        // here caused a cross-check mismatch → 012 even when the SteamID was the
+        // same account. Only mint from the backend when the credential store has
+        // no valid ticket (existingSteamId == 0).
+        auto stored = AppTicket::GetAppOwnershipTicketFromCredentialStore(resp.app_id());
+        const uint64_t existingSteamId = AppTicket::ExtractSteamIdFromTicketBytes(stored);
+
+        std::vector<uint8_t> ticketBytes;
+        if (existingSteamId != 0) {
+            ticketBytes = std::move(stored);
+        } else {
+            auto minted = EticketClient::FetchOwnershipTicket(resp.app_id(), {}, 0);
+            if (!minted) {
+                LOG_NETPACKET_WARN("OwnershipTicketResponse[858]: appid={} eresult={} but no owner ticket available",
+                                   resp.app_id(), origEresult);
+                return;
+            }
+            ticketBytes = std::move(*minted);
+        }
+
+        resp.set_ticket(ticketBytes.data(), ticketBytes.size());
+        resp.set_eresult(k_EResultOK);
+
+        const auto encSize = resp.ByteSizeLong();
+        if (encSize > sizeof(g_NewBody)) {
+            LOG_NETPACKET_WARN("OwnershipTicketResponse[858]: modified message too large ({})", encSize);
+            return;
+        }
+        if (!resp.SerializeToArray(g_NewBody, sizeof(g_NewBody))) {
+            LOG_NETPACKET_WARN("OwnershipTicketResponse[858]: failed to SerializeToArray");
+            return;
+        }
+
+        g_cbNewBody = static_cast<uint32>(encSize);
         g_NeedReplaceBody = true;
+        LOG_NETPACKET_INFO("OwnershipTicketResponse[858]: spoofed appid={} ticket_bytes={} (orig eresult={} -> OK)",
+                           resp.app_id(), ticketBytes.size(), origEresult);
     }
 
-} // namespace Hooks_NetPacket_FamilySharing
+} // namespace Hooks_NetPacket_OwnershipTicket
+
+
+// ════════════════════════════════════════════════════════════════
+//  Hooks_NetPacket_Licenses
+//
+//  Incoming: CMsgClientLicenseList (eMsg 780)
+//
+//  Steam sends this once shortly after logon. It is the only place the
+//  full set of owned package ids appears — CheckAppOwnership answers per
+//  app and only for apps something asks about, so it can never enumerate.
+//  Read-only: the message is handed on untouched.
+// ════════════════════════════════════════════════════════════════
+namespace Hooks_NetPacket_Licenses {
+
+    void HandleRecv(const uint8* pBody, uint32 cbBody)
+    {
+        CMsgClientLicenseList msg;
+        if (!msg.ParseFromArray(pBody, cbBody)) {
+            LOG_PACKAGE_WARN("LicenseList: failed to parse CMsgClientLicenseList");
+            return;
+        }
+
+        std::vector<Hooks_Package::License> licenses;
+        licenses.reserve(static_cast<size_t>(msg.licenses_size()));
+
+        for (int i = 0; i < msg.licenses_size(); ++i) {
+            const auto& lic = msg.licenses(i);
+            if (!lic.has_package_id()) continue;
+            licenses.push_back({static_cast<PackageId_t>(lic.package_id()),
+                                lic.has_access_token() ? lic.access_token() : 0});
+        }
+
+        LOG_PACKAGE_INFO("LicenseList: {} license(s), eresult={}",
+                         licenses.size(), msg.has_eresult() ? msg.eresult() : 0);
+
+        Hooks_Package::OnLicenseList(std::move(licenses));
+        Hooks_Package::TryDumpOwnedDepots();
+    }
+
+} // namespace Hooks_NetPacket_Licenses
+
+
+// ════════════════════════════════════════════════════════════════
+//  Hooks_NetPacket_ManifestProbe
+//
+//  Originates ContentServerDirectory.GetManifestRequestCode#1 rather
+//  than waiting for Steam to ask, and logs the code that comes back.
+//
+//  Everything else in this file reacts: it rewrites frames Steam is
+//  already sending, or manufactures inbound ones. This is the only
+//  path that initiates, which needs three things Steam normally
+//  supplies and we have to borrow:
+//
+//    * the websocket object    — only visible inside the send hook
+//    * a valid header          — steamid/session must be right, so a
+//                                real outbound header is kept as a
+//                                template rather than built from parts
+//    * a jobid                 — taken from a high, distinctive range
+//                                so it can never collide with Steam's
+//
+//  Calling oBBuildAndAsyncSendFrame directly bypasses the send hook,
+//  so Hooks_NetPacket_Manifest::HandleSend never sees these and no
+//  provider fetch is started for them. The reply still passes through
+//  that namespace's HandleRecv, which bails on an unrecognised jobid.
+// ════════════════════════════════════════════════════════════════
+namespace Hooks_NetPacket_ManifestProbe {
+
+    // Captured from the send hook; needed to transmit at all. The send
+    // trampoline is handed over rather than referenced directly, because
+    // HOOK_FUNC declares it further down this file.
+    using SendFrameFn = bool(__fastcall*)(void*, EWebSocketOpCode, uint8*, uint32);
+    void*       g_pWebSocket = nullptr;
+    SendFrameFn g_sendFrame  = nullptr;
+
+    // A real outbound ServiceMethodCallFromClient header, kept whole and
+    // reused. Cheaper and far more robust than assembling one: whatever
+    // routing fields Steam includes come along automatically.
+    std::vector<uint8> g_HdrTemplate;
+    std::mutex         g_Mutex;
+
+    // Well clear of Steam's own job ids, which count up from small values.
+    constexpr uint64 kJobIdBase = 0x7E51'0000'0000'0000ull;
+    uint64 g_NextJobId = kJobIdBase;
+
+    struct Pending {
+        AppId_t appId;
+        uint32  depotId;
+        uint64  manifestGid;
+        std::promise<uint64> result;
+        std::chrono::steady_clock::time_point sentAt;
+    };
+    std::unordered_map<uint64, Pending> g_Pending;
+
+    // Steam answers everything it is asked, but a disconnect between send and
+    // reply would otherwise leave a promise nobody ever fulfils and a caller
+    // blocked on it forever. Swept on each new request.
+    constexpr auto kPendingTimeout = std::chrono::seconds(30);
+
+    void ExpireStale()   // caller holds g_Mutex
+    {
+        const auto now = std::chrono::steady_clock::now();
+        for (auto it = g_Pending.begin(); it != g_Pending.end(); ) {
+            if (now - it->second.sentAt > kPendingTimeout) {
+                LOG_MANIFEST_WARN("ManifestProbe: no reply for depot {} (jobid={}) after {}s",
+                                  it->second.depotId, it->first,
+                                  std::chrono::duration_cast<std::chrono::seconds>(kPendingTimeout).count());
+                it->second.result.set_value(0);
+                it = g_Pending.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    void CaptureContext(void* pObject, SendFrameFn sendFrame,
+                        const uint8* pHdr, uint32 cbHdr)
+    {
+        std::lock_guard<std::mutex> lock(g_Mutex);
+        if (pObject)   g_pWebSocket = pObject;
+        if (sendFrame) g_sendFrame  = sendFrame;
+        if (g_HdrTemplate.empty() && pHdr && cbHdr)
+            g_HdrTemplate.assign(pHdr, pHdr + cbHdr);
+    }
+
+    bool Ready()
+    {
+        std::lock_guard<std::mutex> lock(g_Mutex);
+        return g_pWebSocket && g_sendFrame && !g_HdrTemplate.empty();
+    }
+
+    // Sends the request and hands back a future for the code. A future holding
+    // 0 means the request failed, was refused by Steam, or timed out — callers
+    // treat all three the same way.
+    std::future<uint64> Request(AppId_t appId, uint32 depotId, uint64 manifestGid)
+    {
+        // Every early exit resolves the promise with 0 rather than dropping it,
+        // so a caller waiting on the future is never left hanging on a request
+        // that was never sent.
+        std::promise<uint64> promise;
+        std::future<uint64>  future = promise.get_future();
+        auto failWith = [&promise, &future]() -> std::future<uint64> {
+            promise.set_value(0);
+            return std::move(future);
+        };
+
+        std::vector<uint8> hdrTemplate;
+        void*       ws    = nullptr;
+        SendFrameFn send  = nullptr;
+        uint64      jobId = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_Mutex);
+            ExpireStale();
+            if (!g_pWebSocket || !g_sendFrame || g_HdrTemplate.empty()) {
+                LOG_MANIFEST_WARN("ManifestProbe: no send context captured yet "
+                                  "(websocket={}, sendFn={}, header={} bytes) - is Steam logged in?",
+                                  g_pWebSocket != nullptr, g_sendFrame != nullptr,
+                                  g_HdrTemplate.size());
+                return failWith();
+            }
+            hdrTemplate = g_HdrTemplate;
+            ws          = g_pWebSocket;
+            send        = g_sendFrame;
+            jobId       = ++g_NextJobId;
+        }
+
+        CMsgProtoBufHeader hdr;
+        if (!hdr.ParseFromArray(hdrTemplate.data(), static_cast<int>(hdrTemplate.size()))) {
+            LOG_MANIFEST_WARN("ManifestProbe: header template failed to parse");
+            return failWith();
+        }
+        hdr.set_target_job_name("ContentServerDirectory.GetManifestRequestCode#1");
+        hdr.set_jobid_source(jobId);
+        hdr.clear_jobid_target();
+
+        CContentServerDirectory_GetManifestRequestCode_Request req;
+        req.set_app_id(appId);
+        req.set_depot_id(depotId);
+        req.set_manifest_id(manifestGid);
+
+        const uint32 cbHdr  = static_cast<uint32>(hdr.ByteSizeLong());
+        const uint32 cbBody = static_cast<uint32>(req.ByteSizeLong());
+        std::vector<uint8> frame(sizeof(MsgHdr) + cbHdr + cbBody);
+
+        auto* mhdr = reinterpret_cast<MsgHdr*>(frame.data());
+        mhdr->eMsg = static_cast<EMsg>(
+            static_cast<uint32>(k_EMsgServiceMethodCallFromClient) | kMsgHdrProtoFlag);
+        mhdr->headerLength = cbHdr;
+
+        if (!hdr.SerializeToArray(frame.data() + sizeof(MsgHdr), cbHdr) ||
+            !req.SerializeToArray(frame.data() + sizeof(MsgHdr) + cbHdr, cbBody)) {
+            LOG_MANIFEST_WARN("ManifestProbe: failed to serialise request frame");
+            return failWith();
+        }
+
+        // Registered before sending: the reply can arrive on another thread the
+        // instant the frame goes out, and it must find the entry already there.
+        {
+            std::lock_guard<std::mutex> lock(g_Mutex);
+            Pending& p     = g_Pending[jobId];
+            p.appId        = appId;
+            p.depotId      = depotId;
+            p.manifestGid  = manifestGid;
+            p.result       = std::move(promise);
+            p.sentAt       = std::chrono::steady_clock::now();
+        }
+
+        LOG_MANIFEST_INFO("ManifestProbe send: app={} depot={} gid={} jobid={} ({} bytes)",
+                          appId, depotId, manifestGid, jobId, frame.size());
+
+        if (!send(ws, k_eWebSocketOpCode_Binary,
+                  frame.data(), static_cast<uint32>(frame.size()))) {
+            LOG_MANIFEST_WARN("ManifestProbe: send returned false for jobid={}", jobId);
+            std::lock_guard<std::mutex> lock(g_Mutex);
+            auto it = g_Pending.find(jobId);
+            if (it != g_Pending.end()) {
+                it->second.result.set_value(0);
+                g_Pending.erase(it);
+            }
+        }
+        return future;
+    }
+
+    // True when the reply belonged to us, meaning the normal manifest
+    // handler should not look at it.
+    bool HandleRecv(const uint8* pBody, uint32 cbBody, const uint8* pHdr, uint32 cbHdr)
+    {
+        CMsgProtoBufHeader hdr;
+        if (!hdr.ParseFromArray(pHdr, cbHdr) || !hdr.has_jobid_target()) return false;
+
+        const uint64 jobId = hdr.jobid_target();
+        if (jobId < kJobIdBase) return false;   // cheap reject before locking
+
+        AppId_t appId = 0;
+        uint32  depotId = 0;
+        uint64  gid = 0;
+        std::promise<uint64> result;
+        {
+            std::lock_guard<std::mutex> lock(g_Mutex);
+            auto it = g_Pending.find(jobId);
+            if (it == g_Pending.end()) return false;
+            appId   = it->second.appId;
+            depotId = it->second.depotId;
+            gid     = it->second.manifestGid;
+            result  = std::move(it->second.result);
+            g_Pending.erase(it);
+        }
+
+        CContentServerDirectory_GetManifestRequestCode_Response resp;
+        if (!resp.ParseFromArray(pBody, cbBody)) {
+            LOG_MANIFEST_WARN("ManifestProbe recv: failed to parse response for jobid={}", jobId);
+            result.set_value(0);
+            return true;
+        }
+
+        const uint64 code = resp.has_manifest_request_code() ? resp.manifest_request_code() : 0;
+        const int32  res  = hdr.has_eresult() ? hdr.eresult() : 0;
+
+        if (code) {
+            LOG_MANIFEST_INFO("ManifestProbe recv: app={} depot={} gid={} -> code={} (eresult={})",
+                              appId, depotId, gid, code, res);
+        } else {
+            // eresult 2 is generic failure, which normally means the depot is
+            // not licensed to this account. eresult 8 (InvalidParam) has also
+            // been seen on an app_id=0 request for a depot the account does
+            // own — 0 satisfies the access check most of the time but not
+            // reliably, so a failure here is not proof of missing ownership.
+            LOG_MANIFEST_WARN("ManifestProbe recv: app={} depot={} gid={} -> NO CODE (eresult={})",
+                              appId, depotId, gid, res);
+        }
+        result.set_value(code);
+        return true;
+    }
+
+} // namespace Hooks_NetPacket_ManifestProbe
 
 
 // ════════════════════════════════════════════════════════════════
@@ -492,6 +1240,14 @@ namespace Hooks_NetPacket_Manifest {
     std::mutex g_CodeMutex;
     constexpr uint32 kMaxWaitSeconds = 12;
 
+    // Passive capture: jobid_source -> (depot, gid) for every outgoing request,
+    // so HandleRecv can harvest the genuine code Steam returns for depots this
+    // account can access. Capped to bound memory if a reply never arrives.
+    struct SentReq { uint32 depot; uint64 gid; };
+    std::unordered_map<uint64, SentReq> g_SentRequests;
+    std::mutex g_SentMutex;
+    constexpr size_t kMaxSentTracked = 4096;
+
     bool HandleSend(const uint8* pBody, uint32 cbBody,
                     const uint8* pHdr, uint32 cbHdr)
     {
@@ -501,22 +1257,102 @@ namespace Hooks_NetPacket_Manifest {
             return false;
         }
         if (!req.has_depot_id() || !req.has_manifest_id()) return false;
-        if (!LuaConfig::HasDepot(req.depot_id())) return false;
 
+        const uint64 manifestGid = req.manifest_id();
+        const uint32 depotId     = req.depot_id();
+        const uint32 appId       = req.has_app_id() ? req.app_id() : 0;
+
+        // Parse the header up front: the jobid_source correlates the reply, and
+        // both the passive-capture and injection paths below need it.
         CMsgProtoBufHeader hdr;
-        if (!hdr.ParseFromArray(pHdr, cbHdr) || !hdr.has_jobid_source()) {
+        const bool haveJob = hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_jobid_source();
+        const uint64 jobId = haveJob ? hdr.jobid_source() : 0;
+
+        // Passive capture: remember this request so HandleRecv can harvest the
+        // real code Steam is about to return — every request, not just Lua ones,
+        // because a genuine code from any depot the user actually downloads is
+        // worth keeping and costs no extra Steam traffic. Gated on [donate],
+        // where captured codes are sent.
+        if (haveJob && Config::GetDonateSettings().enabled) {
+            std::lock_guard<std::mutex> lock(g_SentMutex);
+            if (g_SentRequests.size() < kMaxSentTracked)
+                g_SentRequests[jobId] = {depotId, manifestGid};
+        }
+
+        // ── Injection path: only Lua depots we don't own get their code swapped
+        //    for a fetched one. Everything else passes through untouched (and is
+        //    a passive-capture candidate above). ──────────────────────────────
+        if (!LuaConfig::HasDepot(depotId)) return false;
+
+        // A depot can be both Lua-added and genuinely owned — 680 of them on one
+        // test machine. There Steam is about to receive a real, working code, so
+        // replacing it with a fetched one can only make things worse: since Valve
+        // made codes depot-bound the fetched one is carrier-minted and the CDN
+        // 401s it, turning a download that would have worked into "Failed
+        // downloading 1 manifests".
+        //
+        // HasDepot(checkOwned=true) above is meant to catch this but cannot: it
+        // tests OwnedAppIdSet, which MarkOwned fills with *app* ids, against the
+        // *depot* id passed here. BuildDepotDependency has already recorded the
+        // depot -> app mapping (it runs seconds earlier), so bridge through that.
+        AppId_t  seenApp = 0;
+        uint64_t seenGid = 0;
+        if (Hooks_Manifest::LookupDepot(depotId, seenApp, seenGid) &&
+            seenApp && LuaConfig::IsOwned(seenApp)) {
+            LOG_MANIFEST_INFO("GetManifestRequestCode: depot={} belongs to owned app {}, "
+                              "leaving Steam's own code alone", depotId, seenApp);
+            return false;
+        }
+
+        if (!haveJob) {
             LOG_MANIFEST_WARN("GetManifestRequestCode: missing jobid_source in header");
             return false;
         }
 
-        uint64 jobId       = hdr.jobid_source();
-        uint64 manifestGid = req.manifest_id();
-        uint32 depotId     = req.depot_id();
-        uint32 appId       = req.has_app_id() ? req.app_id() : 0;
-
         LOG_MANIFEST_DEBUG("GetManifestRequestCode send: depot={} gid={} jobid={} app_id={}",
                             depotId, manifestGid, jobId, appId);
 
+        // Pre-seed <steam>\depotcache from the archive for the EXACT manifest
+        // Steam is asking a code for. This request is the ground truth of what
+        // Steam will download - BuildDepotDependency's gid can differ (an ACF-
+        // pinned target vs the resolved latest), so trigger the fetch here where
+        // the gid is authoritative. Detached + best-effort; if the archive has it,
+        // Steam's own retry (~30 s) finds the manifest on disk and skips the code
+        // path entirely. A miss just falls through to the fetched-code attempt.
+        {
+            const AppId_t  a = appId;
+            const uint32   d = depotId;
+            const uint64   g = manifestGid;
+            // A code request fires for BOTH real user downloads and Steam's
+            // background scheduled-update retries (~every 30 s). Only an app that
+            // is actively downloading is a real user action; only then do we
+            // bypass the negative cache (fetch fresh, to pick up a just-supplied
+            // manifest) and surface the "not ready" box. Scheduled/queued requests
+            // ride the negative cache and stay silent, so they neither hammer the
+            // archive nor spam popups.
+            // A game's DLC depots carry the DLC app id, but only the BASE game is
+            // marked downloading - so checking this depot's own app id misses it
+            // (verified: appActive=false while dlCount=1 during a Sims 4 DLC
+            // download). Use "is any app actively downloading": true during a real
+            // user download, false at idle startup when Steam is only retrying its
+            // scheduled-update queue.
+            const bool active = Hooks_SteamUI::ActiveDownloadCount() > 0;
+            OSTPlatform::Thread::StartDetached([a, d, g, active]() -> uint32_t {
+                bool notArchived = false;
+                bool ok = ManifestCache::EnsureCached(a, d, g, 0, &notArchived, /*bypassNeg=*/active);
+                if (active && !ok && notArchived)
+                    Hooks_Manifest::ReportMissingManifest(d, g);
+                return 0;
+            });
+        }
+
+        // Note: a manifest already present in config\depotcache does NOT let us
+        // skip this. Measured 2026-09-09 — depot 4889481's manifest was on disk
+        // and Steam still requested a code, put it straight into the CDN path
+        // (/depot/<d>/manifest/<gid>/5/<code>) and downloaded the manifest
+        // afresh. Answering with a placeholder produced 401 on every CDN and
+        // "update canceled : Failed downloading 1 manifests". The code is used
+        // and must be genuine.
         auto task = std::async(std::launch::async,
             [manifestGid, depotId, appId]() -> uint64 {
                 uint64 code = 0;
@@ -542,6 +1378,35 @@ namespace Hooks_NetPacket_Manifest {
         }
 
         uint64 jobId = hdr.jobid_target();
+
+        // Passive capture: harvest the genuine code from this reply before the
+        // injection path below can overwrite the body. Only real successes for a
+        // request we tracked on send; the injected (non-owned) case naturally
+        // filters out here because Steam's own reply carries no valid code.
+        {
+            SentReq sent{0, 0};
+            bool tracked = false;
+            {
+                std::lock_guard<std::mutex> lock(g_SentMutex);
+                auto it = g_SentRequests.find(jobId);
+                if (it != g_SentRequests.end()) {
+                    sent = it->second;
+                    tracked = true;
+                    g_SentRequests.erase(it);
+                }
+            }
+            if (tracked && hdr.eresult() == static_cast<int32_t>(k_EResultOK)) {
+                CContentServerDirectory_GetManifestRequestCode_Response resp;
+                if (resp.ParseFromArray(pBody, cbBody) &&
+                    resp.has_manifest_request_code() && resp.manifest_request_code()) {
+                    const uint64 code = resp.manifest_request_code();
+                    LOG_MANIFEST_DEBUG("GetManifestRequestCode recv: captured genuine code "
+                                       "for depot={} gid={}", sent.depot, sent.gid);
+                    ManifestDonor::SubmitCapturedCode(sent.depot, sent.gid, code);
+                }
+            }
+        }
+
         std::shared_future<uint64> future;
 
         {
@@ -871,13 +1736,13 @@ namespace Hooks_NetPacket_RichPresence {
         if (!g_InjectPending || g_cbInjectPkt == 0) return;
         g_InjectPending = false;
 
-        uint8* origData = pCarrier->m_pubData;
-        uint32 origSize = pCarrier->m_cubData;
-        pCarrier->m_pubData = g_InjectPkt;
-        pCarrier->m_cubData = g_cbInjectPkt;
+        uint8* origData = NetPkt::Data(pCarrier);
+        uint32 origSize = NetPkt::Size(pCarrier);
+        NetPkt::Data(pCarrier) = g_InjectPkt;
+        NetPkt::Size(pCarrier) = g_cbInjectPkt;
         invokeOriginal(pThis, pCarrier);
-        pCarrier->m_pubData = origData;
-        pCarrier->m_cubData = origSize;
+        NetPkt::Data(pCarrier) = origData;
+        NetPkt::Size(pCarrier) = origSize;
         LOG_RICHPRESENCE_INFO("Delivered manufactured self-PersonaState ({} bytes)", g_cbInjectPkt);
     }
 
@@ -916,7 +1781,7 @@ namespace Hooks_NetPacket_OnlineFix {
             // Fill game_extra_info with the real game name.
             if (appid == kOnlineFixAppId) {
                 AppId_t realAppId = Hooks_Misc::ResolveAppId();
-                if (realAppId && LuaConfig::HasDepot(realAppId)) {
+                if (realAppId && realAppId != kOnlineFixAppId) {
                     std::string name = Hooks_Misc::GetGameNameByAppID(realAppId);
                     if (!name.empty()) {
                         game->set_game_extra_info(name);
@@ -1104,18 +1969,113 @@ namespace Hooks_NetPacket_Cloud {
                 g_pending.pop_front();
             }
 
-            uint8* origData = pCarrier->m_pubData;
-            uint32 origSize = pCarrier->m_cubData;
-            pCarrier->m_pubData = pkt.data();
-            pCarrier->m_cubData = static_cast<uint32>(pkt.size());
+            uint8* origData = NetPkt::Data(pCarrier);
+            uint32 origSize = NetPkt::Size(pCarrier);
+            NetPkt::Data(pCarrier) = pkt.data();
+            NetPkt::Size(pCarrier) = static_cast<uint32>(pkt.size());
             invokeOriginal(pThis, pCarrier);
-            pCarrier->m_pubData = origData;
-            pCarrier->m_cubData = origSize;
+            NetPkt::Data(pCarrier) = origData;
+            NetPkt::Size(pCarrier) = origSize;
             LOG_NETPACKET_DEBUG("Cloud: delivered {}-byte response", pkt.size());
         }
     }
 
 } // namespace Hooks_NetPacket_Cloud
+
+
+// ════════════════════════════════════════════════════════════════
+//  Legacy third-party CD key ("Updating product key")
+//
+//  k_EMsgClientGetLegacyGameKey (730) is a non-proto STRUCT message, so it
+//  never reaches the proto SendJob/RecvJob path (UnpackRaw bails on the missing
+//  proto flag). We catch the outbound request straight off the send hook,
+//  answer it locally with a resolved key, suppress the real send, and deliver
+//  the synthesized 785 response from the RecvPkt hook — the exact "answered
+//  locally" trick Hooks_NetPacket_Cloud uses.
+// ════════════════════════════════════════════════════════════════
+namespace Hooks_NetPacket_LegacyKey {
+
+    std::mutex                     g_queueMutex;
+    std::deque<std::vector<uint8>> g_pending;   // ready-to-inject 785 struct frames
+
+    // Returns true when we answered the request locally — the caller must then
+    // suppress the outbound frame.
+    bool HandleSend(const uint8* pubData, uint32 cubData) {
+        if (cubData < sizeof(ExtendedMsgHdr) + sizeof(MsgClientGetLegacyGameKey))
+            return false;
+
+        const auto* reqHdr  = reinterpret_cast<const ExtendedMsgHdr*>(pubData);
+        const auto* reqBody = reinterpret_cast<const MsgClientGetLegacyGameKey*>(
+                                  pubData + sizeof(ExtendedMsgHdr));
+        const AppId_t appId     = reqBody->m_unAppId;
+        const uint32  accountId = static_cast<uint32>(reqHdr->m_ulSteamID & 0xFFFFFFFFull);
+
+        std::optional<std::string> key = LegacyCDKey::Resolve(appId, accountId);
+        if (!key) return false;   // not a managed app — let Steam's real flow run
+
+        // Steam stores the legacy key as a NUL-terminated string; length counts
+        // the terminator. (One runtime-verify point — see plan.)
+        const uint32 cchKey = static_cast<uint32>(key->size()) + 1;
+        const uint32 total  = sizeof(ExtendedMsgHdr)
+                            + sizeof(MsgClientGetLegacyGameKeyResponse) + cchKey;
+        if (total > kMaxPacketSize) {
+            LOG_NETPACKET_WARN("LegacyKey: app={} response too large ({} bytes), passing through",
+                               appId, total);
+            return false;
+        }
+
+        std::vector<uint8> pkt(total);
+        auto* rh = reinterpret_cast<ExtendedMsgHdr*>(pkt.data());
+        *rh = *reqHdr;                                            // keep version/canary/steamid/session
+        rh->eMsg          = k_EMsgClientGetLegacyGameKeyResponse; // non-proto (flag stays clear)
+        rh->m_JobIDTarget = reqHdr->m_JobIDSource;               // correlate response to request
+        rh->m_JobIDSource = k_GIDNil;
+
+        auto* rb = reinterpret_cast<MsgClientGetLegacyGameKeyResponse*>(
+                       pkt.data() + sizeof(ExtendedMsgHdr));
+        rb->m_unAppId = appId;
+        rb->m_eResult = k_EResultOK;
+        rb->m_cchKey  = cchKey;
+        memcpy(pkt.data() + sizeof(ExtendedMsgHdr) + sizeof(MsgClientGetLegacyGameKeyResponse),
+               key->c_str(), cchKey);                             // includes the NUL
+
+        {
+            std::lock_guard lk(g_queueMutex);
+            if (g_pending.size() < 64)
+                g_pending.push_back(std::move(pkt));
+        }
+        LOG_NETPACKET_DEBUG("LegacyKey: app={} answered locally ({} bytes, key '{}')",
+                            appId, total, *key);
+        return true;
+    }
+
+    // Deliver queued responses by borrowing the carrier packet for one oRecvPkt
+    // call each — identical to Hooks_NetPacket_Cloud::Drain. Runs on the network
+    // thread from inside the RecvPkt hook.
+    void Drain(void* pThis, CNetPacket* pCarrier,
+               bool (*invokeOriginal)(void*, CNetPacket*))
+    {
+        for (;;) {
+            std::vector<uint8> pkt;
+            {
+                std::lock_guard lk(g_queueMutex);
+                if (g_pending.empty()) return;
+                pkt = std::move(g_pending.front());
+                g_pending.pop_front();
+            }
+
+            uint8* origData = NetPkt::Data(pCarrier);
+            uint32 origSize = NetPkt::Size(pCarrier);
+            NetPkt::Data(pCarrier) = pkt.data();
+            NetPkt::Size(pCarrier) = static_cast<uint32>(pkt.size());
+            invokeOriginal(pThis, pCarrier);
+            NetPkt::Data(pCarrier) = origData;
+            NetPkt::Size(pCarrier) = origSize;
+            LOG_NETPACKET_DEBUG("LegacyKey: delivered {}-byte response", pkt.size());
+        }
+    }
+
+} // namespace Hooks_NetPacket_LegacyKey
 
 
 // ════════════════════════════════════════════════════════════════
@@ -1138,6 +2098,11 @@ namespace {
             if (std::strcmp(targetJobName, "Cloud.SignalAppExitSyncDone#1") == 0 ||
                 std::strcmp(targetJobName, "Cloud.ClientConflictResolution#1") == 0)
                 return false;
+            // Only swallow the request if we can actually deliver the answer.
+            // Drain() runs from the RecvPkt hook, which does nothing until the
+            // packet layout is known — suppressing the send before then would
+            // leave the job waiting forever on a reply that never comes.
+            if (!NetPkt::IsResolved()) return false;
             if (Hooks_NetPacket_Cloud::HandleSend(targetJobName, pBody, cbBody, pHdr, cbHdr))
                 g_SuppressSend = true;
             return false;   // never body-replace a cloud frame
@@ -1150,6 +2115,14 @@ namespace {
 
         case HASH_JOB_GetManifestRequestCode:
             return Hooks_NetPacket_Manifest::HandleSend(pBody, cbBody, pHdr, cbHdr);
+
+        case HASH_JOB_GetGameAchievements:
+            Hooks_NetPacket_UserStats::HandleSend_GetGameAchievements(pBody, cbBody, pHdr, cbHdr);
+            return false;
+
+        case HASH_JOB_GetUserAchievements:
+            Hooks_NetPacket_UserStats::HandleSend_GetUserAchievements(pBody, cbBody, pHdr, cbHdr);
+            return false;
 
         // ---- add new 151 service methods here ----
         }
@@ -1168,6 +2141,8 @@ namespace {
         switch (eMsg) {
 
         case k_EMsgServiceMethodCallFromClient: {   // 151
+            // Keep one real header as a template for originated requests.
+            Hooks_NetPacket_ManifestProbe::CaptureContext(nullptr, nullptr, pHdr, cbHdr);
             CMsgProtoBufHeader hdr;
             if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_target_job_name()) {
                 g_NeedReplaceSend = SendServiceJob(hdr.target_job_name().c_str(), pBody, cbBody, pHdr, cbHdr);
@@ -1214,16 +2189,25 @@ namespace {
 
         switch (Fnv1aHash(targetJobName)) {
 
-        case HASH_JOB_NotifyRunningApps:
-            Hooks_NetPacket_FamilySharing::ClearBody(pBody, cbBody);
-            return;
-
         case HASH_JOB_GetUserStats:
             Hooks_NetPacket_UserStats::HandleRecv_GetUserStatsResponse(pHdr, cbHdr, pBody, cbBody);
             return;
 
         case HASH_JOB_GetManifestRequestCode:
+            // Replies to our own originated requests are consumed here; the
+            // normal handler would ignore them anyway, but this keeps the two
+            // paths from ever having to reason about each other.
+            if (Hooks_NetPacket_ManifestProbe::HandleRecv(pBody, cbBody, pHdr, cbHdr))
+                return;
             Hooks_NetPacket_Manifest::HandleRecv(pBody, cbBody, pHdr, cbHdr);
+            return;
+
+        case HASH_JOB_GetGameAchievements:
+            Hooks_NetPacket_UserStats::HandleRecv_GetGameAchievementsResponse(pHdr, cbHdr, pBody, cbBody);
+            return;
+
+        case HASH_JOB_GetUserAchievements:
+            Hooks_NetPacket_UserStats::HandleRecv_GetUserAchievementsResponse(pHdr, cbHdr, pBody, cbBody);
             return;
 
         // ---- add new 147 service methods here ----
@@ -1262,12 +2246,16 @@ namespace {
                 pBody, cbBody);
             return;
 
-        case k_EMsgClientSharedLibraryStopPlaying:     // 9406
-            Hooks_NetPacket_FamilySharing::ClearBody(pBody, cbBody);
-            return;
-
         case k_EMsgClientPersonaState:                 // 766
             g_NeedReplaceBody = Hooks_NetPacket_RichPresence::HandleRecv(pBody, cbBody, pHdr, cbHdr);
+            return;
+
+        case k_EMsgClientGetAppOwnershipTicketResponse:   // 858
+            Hooks_NetPacket_OwnershipTicket::HandleRecv(pBody, cbBody);
+            return;
+
+        case k_EMsgClientLicenseList:                  // 780
+            Hooks_NetPacket_Licenses::HandleRecv(pBody, cbBody);
             return;
 
         default:
@@ -1285,6 +2273,29 @@ namespace {
     {
         if (eWebSocketOpCode != k_eWebSocketOpCode_Binary)
             return oBBuildAndAsyncSendFrame(pObject, eWebSocketOpCode, pubData, cubData);
+
+        // The connection object is only ever visible here, and originating a
+        // request needs it. Captured on every binary frame so it tracks a
+        // reconnect rather than going stale.
+        Hooks_NetPacket_ManifestProbe::CaptureContext(
+            pObject, oBBuildAndAsyncSendFrame, nullptr, 0);
+
+        // Legacy CD-key request (EMsg 730) is a non-proto struct message that
+        // UnpackRaw skips. Intercept it here: if we answer it locally, suppress
+        // the real send (the 785 response is delivered from the RecvPkt hook).
+        // As with the cloud path above: answering locally means the reply is
+        // delivered by Drain() from the RecvPkt hook, which is inert until the
+        // packet layout is identified. Let the request go out normally until
+        // then, or the "Updating product key" dialog waits on a reply that is
+        // never delivered.
+        if (cubData >= sizeof(ExtendedMsgHdr) && NetPkt::IsResolved()) {
+            const uint32 rawEMsg = *reinterpret_cast<const uint32*>(pubData);
+            if (!(rawEMsg & kMsgHdrProtoFlag) &&
+                static_cast<EMsg>(rawEMsg) == k_EMsgClientGetLegacyGameKey &&
+                Hooks_NetPacket_LegacyKey::HandleSend(pubData, cubData)) {
+                return true;   // answered locally; report success so Steam treats it as sent
+            }
+        }
 
         EMsg eMsg;
         const uint8 *pHdr, *pBody;
@@ -1318,6 +2329,22 @@ namespace {
 
     HOOK_FUNC(RecvPkt, void*, void* pThis, CNetPacket* pPacket)
     {
+        // Identify the packet layout before anything reads or writes a field.
+        //
+        // This must stay ahead of TryInject/Drain below: those overwrite the
+        // data pointer and size with our own buffers, so probing afterwards
+        // would be measuring whichever offset we had already guessed. Until the
+        // layout is known the packet is handed straight back untouched, so a
+        // field is never accessed at an unverified offset.
+        //
+        // Skipping costs nothing meaningful: RecvJob only acts on protobuf
+        // messages, which is exactly the set the probe latches on, and a Multi
+        // is re-delivered per sub-message. Injections and queued responses are
+        // delayed, not dropped.
+        if (!pPacket) return oRecvPkt(pThis, pPacket);
+        if (!NetPkt::IsResolved() && !TryResolveLayout(pPacket))
+            return oRecvPkt(pThis, pPacket);
+
         Hooks_NetPacket_RichPresence::TryInject(
             pThis, pPacket,
             [](void* pT, CNetPacket* pP) -> bool { return oRecvPkt(pT, pP) != nullptr; });
@@ -1326,10 +2353,18 @@ namespace {
             pThis, pPacket,
             [](void* pT, CNetPacket* pP) -> bool { return oRecvPkt(pT, pP) != nullptr; });
 
+        Hooks_NetPacket_LegacyKey::Drain(
+            pThis, pPacket,
+            [](void* pT, CNetPacket* pP) -> bool { return oRecvPkt(pT, pP) != nullptr; });
+
+        Hooks_NetPacket_UserStats::DrainAchievements(
+            pThis, pPacket,
+            [](void* pT, CNetPacket* pP) -> bool { return oRecvPkt(pT, pP) != nullptr; });
+
         EMsg eMsg;
         const uint8 *pBody, *pHdr;
         uint32 cbBody, cbHdr;
-        if (UnpackRaw(pPacket->m_pubData, pPacket->m_cubData,
+        if (UnpackRaw(NetPkt::Data(pPacket), NetPkt::Size(pPacket),
                      eMsg, pHdr, cbHdr, pBody, cbBody)) {
             g_ResizedInPlace = false;
             RecvJob(eMsg, pBody, cbBody, pHdr, cbHdr);
@@ -1340,7 +2375,7 @@ namespace {
                     g_NewHdr, g_cbNewHdr,
                     pBody, g_NewBodySize);
             } else if (g_ResizedInPlace) {
-                pPacket->m_cubData = sizeof(MsgHdr) + cbHdr + g_NewBodySize;
+                NetPkt::Size(pPacket) = sizeof(MsgHdr) + cbHdr + g_NewBodySize;
             } else if (g_NeedReplaceHdr || g_NeedReplaceBody) {
                 ReplaceRecvPacket(pPacket,
                     g_NeedReplaceHdr  ? g_NewHdr  : pHdr,
@@ -1370,5 +2405,25 @@ namespace Hooks_NetPacket {
         UNINSTALL_HOOK(BBuildAndAsyncSendFrame);
         UNINSTALL_HOOK(RecvPkt);
         UNHOOK_END();
+    }
+
+    std::future<uint64_t> RequestManifestCode(AppId_t appId, uint32_t depotId, uint64_t gid) {
+        return Hooks_NetPacket_ManifestProbe::Request(appId, depotId, gid);
+    }
+
+    bool ProbeManifest(uint32_t depotId) {
+        AppId_t  appId = 0;
+        uint64_t gid   = 0;
+        if (!Hooks_Manifest::LookupDepot(depotId, appId, gid)) {
+            LOG_MANIFEST_WARN("ManifestProbe: depot {} not seen yet - it only becomes known "
+                              "once its app is installed or updated in this session", depotId);
+            return false;
+        }
+        // Fire and forget: the recv handler logs the outcome. Detached so the
+        // config-watcher thread is not blocked on a network round-trip.
+        auto fut = std::make_shared<std::future<uint64_t>>(
+            Hooks_NetPacket_ManifestProbe::Request(appId, depotId, gid));
+        std::thread([fut] { fut->wait(); }).detach();
+        return true;
     }
 }
